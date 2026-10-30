@@ -1,0 +1,156 @@
+name: Build and release A53 packages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize runs so an older build cannot overwrite a newer release.
+concurrency:
+  group: release-a53
+  cancel-in-progress: false
+
+env:
+  OPENWRT_VERSION: 25.12.6
+  SDK_FILE: openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_SHA256: 1c04ac47bdfc361d6aab299eb520d570e368013dedcb8d29cf39dc7168ae642e
+  RELEASE_TAG: a53-latest
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test UCI configuration and rpcd
+        run: |
+          sh tests/test_init.sh
+          sh tests/test_rpcd.sh
+
+      - name: Install SDK prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget zstd
+
+      - name: Download and verify the SDK
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/$SDK_FILE" \
+            "https://downloads.openwrt.org/releases/$OPENWRT_VERSION/targets/mediatek/filogic/$SDK_FILE"
+          echo "$SDK_SHA256  $RUNNER_TEMP/$SDK_FILE" | sha256sum --check
+          mkdir "$RUNNER_TEMP/sdk"
+          tar --zstd -xf "$RUNNER_TEMP/$SDK_FILE" -C "$RUNNER_TEMP/sdk" --strip-components=1
+
+      - name: Install feeds
+        working-directory: ${{ runner.temp }}/sdk
+        run: |
+          cp feeds.conf.default feeds.conf
+          echo "src-link zte_mesh $GITHUB_WORKSPACE/openwrt" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -p zte_mesh zte-mesh luci-app-zte-mesh
+
+      - name: Configure packages
+        working-directory: ${{ runner.temp }}/sdk
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_SIGNED_PACKAGES=n
+          CONFIG_PACKAGE_zte-mesh=m
+          CONFIG_PACKAGE_luci-app-zte-mesh=m
+          CONFIG_LUCI_LANG_zh_Hans=y
+          EOF
+          make defconfig
+          grep -qx 'CONFIG_PACKAGE_zte-mesh=m' .config
+          grep -qx 'CONFIG_PACKAGE_luci-app-zte-mesh=m' .config
+          grep -qx 'CONFIG_TARGET_ARCH_PACKAGES="aarch64_cortex-a53"' .config
+
+      - name: Build OpenWrt packages
+        working-directory: ${{ runner.temp }}/sdk
+        run: |
+          make -j"$(nproc)" V=s package/feeds/zte_mesh/zte-mesh/compile \
+            package/feeds/zte_mesh/luci-app-zte-mesh/compile
+
+      - name: Collect and verify release assets
+        working-directory: ${{ runner.temp }}/sdk
+        run: |
+          mkdir "$GITHUB_WORKSPACE/dist"
+          for package in zte-mesh luci-app-zte-mesh luci-i18n-zte-mesh-zh-cn; do
+            mapfile -t files < <(find bin -type f -name "$package-*.apk")
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "Expected one $package apk, found ${#files[@]}" >&2
+              exit 1
+            fi
+            cp "${files[0]}" "$GITHUB_WORKSPACE/dist/"
+          done
+          {
+            echo "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+            echo "Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "SDK: $SDK_FILE"
+            echo "SDK SHA256: $SDK_SHA256"
+            echo "Runtime SHA256: $(sha256sum "$GITHUB_WORKSPACE/openwrt/zte-mesh/zte-mesh-runtime.tar.gz" | cut -d ' ' -f 1)"
+          } > "$GITHUB_WORKSPACE/dist/BUILD-INFO.txt"
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum ./*.apk BUILD-INFO.txt > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zte-mesh-a53-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zte-mesh-a53-${{ github.sha }}
+          path: dist
+
+      - name: Publish the fixed A53 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          自动更新的 A53 安装包，构建基于 OpenWrt $OPENWRT_VERSION SDK。
+
+          - 架构：aarch64_cortex-a53；包格式：APK（不适用于 opkg/IPK 固件）。
+          - 来源提交：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA
+          - 构建记录：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - 每次 main 更新或手动构建成功后，自动替换本 Release 的附件。
+          - ARM32 原厂程序需要 CPU 支持 AArch32，内核启用 CONFIG_COMPAT、CONFIG_SYSVIPC、CONFIG_PACKET 及所需命名空间。
+          - ip-full、kmod-veth、kmod-sched-core 应从当前设备的配套软件源安装，不能跨内核使用 kmod。
+          - 服务沿用仓库默认配置：默认启用、SSID 为 ImmortalWrt、Wi-Fi 密码为 00000000；接入 AP 前请修改配置。
+          - 此流程打包仓库内的预编译运行环境；修改 C 源码后须先重新生成并提交运行包。
+
+          包未以设备信任的密钥签名，安装示例（需先满足上述依赖）：
+
+          ~~~sh
+          apk add --allow-untrusted ./zte-mesh-*.apk ./luci-app-zte-mesh-*.apk ./luci-i18n-zte-mesh-zh-cn-*.apk
+          ~~~
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Keep the rolling tag aligned with the assets' source commit.
+            gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" -F force=true
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+              --title 'ZTE Mesh A53 — Latest' --notes-file "$RUNNER_TEMP/release-notes.md" --latest
+          fi
+          gh release upload "$RELEASE_TAG" ./*.apk BUILD-INFO.txt SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" --title 'ZTE Mesh A53 — Latest' \
+            --notes-file "$RUNNER_TEMP/release-notes.md" --latest

@@ -53,6 +53,18 @@ OpenWrt 包的构建、真子节点测试的规矩和命令见 [docs/DEVELOPMENT
 
 ## 文档
 
+### A53 自动打包与发布
+
+每次推送 `main`，或在 Actions 中手动运行 **Build and release A53 packages**，都会使用 OpenWrt 25.12.6
+Filogic SDK 打包 `aarch64_cortex-a53` 的 `zte-mesh`、LuCI 和中文翻译 APK。构建成功后自动更新固定的
+[a53-latest Release](https://github.com/Lemonade-22/zte-mesh/releases/tag/a53-latest)，附件含校验文件与构建来源。
+无需额外配置 Secret，发布使用工作流自带的 `GITHUB_TOKEN`。发布失败时可重跑 release job，复用已保存的 Artifact。
+
+此流程使用仓库已提交的 `zte-mesh-runtime.tar.gz`；修改 C 源码后，需先重新生成并提交该运行包。
+安装设备必须支持 AArch32，内核具备 `CONFIG_COMPAT`、SysV IPC、packet socket 和所需命名空间。
+APK 适用于使用 apk 的固件；`ip-full` 和两个 kmod 依赖从设备配套源安装。包沿用默认启用和密码 `00000000`，
+接入真实 AP 前请修改 `/etc/config/zte_mesh`。云端打包成功不代表已完成设备实测。
+
 | 文档 | 内容 |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 原理、运行时结构、各源文件职责、固件来源与哈希、ABI 与沙箱约束、为什么选这条路线 |

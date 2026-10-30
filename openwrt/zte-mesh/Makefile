@@ -19,7 +19,7 @@ define Package/zte-mesh
   SECTION:=net
   CATEGORY:=Network
   TITLE:=ZTE mesh controller runtime (sandboxed vendor multiapd)
-  DEPENDS:=@TARGET_zte +ip-full +kmod-veth +kmod-sched-core
+  DEPENDS:=@(TARGET_zte||TARGET_mediatek_filogic) +ip-full +kmod-veth +kmod-sched-core
   PKGARCH:=aarch64_cortex-a53
 endef
 
